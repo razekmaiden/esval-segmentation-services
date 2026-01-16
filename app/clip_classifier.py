@@ -20,32 +20,37 @@ class CLIPClassifier:
     """
     
     # Class prompts - multiple descriptions per class for better matching
+    # More specific prompts lead to better discrimination
     CLASS_PROMPTS = {
         "water": [
-            "a swimming pool with blue water",
-            "water body from aerial view",
-            "blue water pond or pool",
-            "aquatic surface"
+            "a rectangular swimming pool with clear blue water from above",
+            "bright blue swimming pool aerial view",
+            "turquoise pool water surface",
+            "chlorinated pool water from satellite"
         ],
         "vegetation": [
-            "green vegetation and trees",
-            "natural green area with grass",
-            "forest or garden from above",
-            "green foliage aerial view"
+            "dense green tree canopy from above",
+            "green forest trees aerial view",
+            "lush green garden foliage satellite",
+            "thick vegetation cover from sky"
         ],
         "plantation": [
-            "agricultural crops in rows",
-            "cultivated field from aerial view",
-            "organized plantation or orchard",
-            "farming area with crops"
+            "organized rows of crops aerial view",
+            "agricultural field with parallel rows",
+            "vineyard or orchard from above",
+            "brown cultivated farmland"
         ],
         "building": [
-            "roof of a building from above",
-            "concrete structure aerial view",
-            "house or building roof",
-            "urban construction rooftop"
+            "roof of residential house from above",
+            "gray or brown building rooftop satellite",
+            "concrete building structure aerial",
+            "metal or tile roof from sky"
         ]
     }
+    
+    # Confidence thresholds
+    MIN_CONFIDENCE = 0.22  # Minimum to be considered valid
+    WATER_BONUS = 0.05     # Boost water confidence (pools are distinctive)
     
     def __init__(self, device: str = "cuda"):
         """
@@ -161,14 +166,21 @@ class CLIPClassifier:
         # Aggregate scores by class (take max similarity among prompts)
         class_scores = {}
         for class_name, indices in self.class_indices.items():
-            class_scores[class_name] = similarities[indices].max().item()
+            score = similarities[indices].max().item()
+            # Apply water bonus - pools are very distinctive
+            if class_name == "water":
+                score += self.WATER_BONUS
+            class_scores[class_name] = score
         
         # Get best matching class
         best_class = max(class_scores, key=class_scores.get)
         confidence = class_scores[best_class]
         
+        # Log classification for debugging
+        # print(f"  Mask {mask.sum()} px -> {best_class} ({confidence:.3f})")
+        
         # Threshold - if confidence is too low, mark as "other"
-        if confidence < 0.2:
+        if confidence < self.MIN_CONFIDENCE:
             return "other", confidence
         
         return best_class, confidence

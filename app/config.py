@@ -76,3 +76,13 @@ ZONE_COLOR_RANGES = {
         "val_range": (60, 200)
     }
 }
+
+# Class priority for overlap resolution (higher number = higher priority)
+# Water wins over everything (pools should not be classified as vegetation)
+CLASS_PRIORITY = {
+    "water": 4,       # Highest - pools/water always win
+    "building": 3,    # Second - clear structures
+    "plantation": 2,  # Third - organized crops
+    "vegetation": 1,  # Lowest - residual/default category
+    "other": 0
+}
