@@ -8,8 +8,8 @@ pillow>=10.2.0
 numpy>=1.26.0
 opencv-python-headless>=4.9.0
 
-# PyTorch - CPU version by default (user can switch to CUDA)
---extra-index-url https://download.pytorch.org/whl/cpu
+# PyTorch with CUDA 12.1 support (for RTX 40xx and newer GPUs)
+--extra-index-url https://download.pytorch.org/whl/cu121
 torch>=2.2.0
 torchvision>=0.17.0
 
