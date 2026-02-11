@@ -238,7 +238,7 @@ async def auto_segment(
     features = masks_to_geojson(masks, parsed_bounds, (w, h))
     
     # Merge overlapping masks of same type
-    for zone_type in ["water", "vegetation", "plantation"]:
+    for zone_type in ["water", "vegetation", "plantation", "building"]:
         features = merge_overlapping_masks(features, zone_type)
     
     # Resolve inter-class overlaps - higher confidence wins

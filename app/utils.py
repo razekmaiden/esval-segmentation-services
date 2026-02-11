@@ -269,11 +269,11 @@ def merge_overlapping_masks(
 
 def resolve_class_overlaps(features: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Resolve overlaps between different classes by subtracting higher-confidence
-    class geometries from lower-confidence class geometries.
+    Resolve overlaps between different classes using FIXED priority order.
     
-    A pixel can only belong to one class. The class with the highest confidence
-    takes priority.
+    Priority order (water > building > plantation > vegetation):
+    - Water ALWAYS wins - pools should never be classified as vegetation
+    - This ensures consistent results regardless of confidence scores
     
     Args:
         features: List of GeoJSON features (should be one per class after merging)
@@ -282,28 +282,31 @@ def resolve_class_overlaps(features: list[dict[str, Any]]) -> list[dict[str, Any
         List of GeoJSON features with no inter-class overlaps
     """
     from shapely.geometry import shape, mapping
+    from .config import CLASS_PRIORITY
     
     if len(features) <= 1:
         return features
     
-    # Sort features by confidence (descending) - higher confidence wins
+    # Sort features by CLASS PRIORITY (not confidence) - higher priority wins
     sorted_features = sorted(
         features, 
-        key=lambda f: f["properties"].get("confidence", 0), 
+        key=lambda f: CLASS_PRIORITY.get(f["properties"].get("classification", "other"), 0), 
         reverse=True
     )
     
     resolved_features = []
-    accumulated_geometry = None  # Union of all higher-confidence geometries
+    accumulated_geometry = None  # Union of all higher-priority geometries
     
-    for i, feature in enumerate(sorted_features):
+    for feature in sorted_features:
         try:
+            classification = feature["properties"].get("classification", "other")
             feature_shape = shape(feature["geometry"])
+            
             if not feature_shape.is_valid:
                 feature_shape = feature_shape.buffer(0)
             
             if accumulated_geometry is not None:
-                # Subtract all higher-confidence geometries from this one
+                # Subtract all higher-priority geometries from this one
                 feature_shape = feature_shape.difference(accumulated_geometry)
             
             if feature_shape.is_empty:
