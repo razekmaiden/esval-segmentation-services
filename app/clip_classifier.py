@@ -26,31 +26,41 @@ class CLIPClassifier:
             "a rectangular swimming pool with clear blue water from above",
             "bright blue swimming pool aerial view",
             "turquoise pool water surface",
-            "chlorinated pool water from satellite"
+            "chlorinated pool water seen from satellite"
         ],
         "vegetation": [
-            "dense green tree canopy from above",
-            "green forest trees aerial view",
-            "lush green garden foliage satellite",
-            "thick vegetation cover from sky"
+            "dense green tree canopy seen from above",
+            "green garden trees and bushes aerial view",
+            "lush green garden foliage from satellite",
+            "thick green vegetation cover from sky"
         ],
         "plantation": [
             "organized rows of crops aerial view",
-            "agricultural field with parallel rows",
-            "vineyard or orchard from above",
+            "agricultural field with parallel crop rows",
+            "vineyard or orchard rows from above",
             "brown cultivated farmland"
         ],
         "building": [
-            "roof of residential house from above",
-            "gray or brown building rooftop satellite",
-            "concrete building structure aerial",
-            "metal or tile roof from sky"
+            "residential house rooftop seen from above",
+            "gray concrete building roof aerial satellite view",
+            "corrugated metal roof of a house from above",
+            "brown or red tile roof from satellite"
+        ],
+        "other_surface": [
+            "gray asphalt road or pavement from above",
+            "bare dry soil or dirt ground aerial view",
+            "concrete parking lot seen from satellite",
+            "unpaved gravel surface from above"
         ]
     }
     
+    # Target classes that we want to keep in final output
+    TARGET_CLASSES = {"water", "vegetation", "plantation", "building"}
+    
     # Confidence thresholds
-    MIN_CONFIDENCE = 0.22  # Minimum to be considered valid
-    WATER_BONUS = 0.05     # Boost water confidence (pools are distinctive)
+    MIN_CONFIDENCE = 0.23  # Minimum to be considered valid
+    WATER_BONUS = 0.0      # No artificial bias — let raw scores decide
+    MARGIN_THRESHOLD = 0.005  # Winner must beat runner-up by this margin
     
     def __init__(self, device: str = "cuda"):
         """
@@ -167,23 +177,29 @@ class CLIPClassifier:
         class_scores = {}
         for class_name, indices in self.class_indices.items():
             score = similarities[indices].max().item()
-            # Apply water bonus - pools are very distinctive
+            # Apply water bonus (currently 0.0 — no bias)
             if class_name == "water":
                 score += self.WATER_BONUS
             class_scores[class_name] = score
         
         # Get best matching class
-        best_class = max(class_scores, key=class_scores.get)
-        confidence = class_scores[best_class]
-        
-        # Log classification for debugging
-        # print(f"  Mask {mask.sum()} px -> {best_class} ({confidence:.3f})")
+        sorted_classes = sorted(class_scores.items(), key=lambda x: x[1], reverse=True)
+        best_class, best_score = sorted_classes[0]
+        runner_up_score = sorted_classes[1][1]
         
         # Threshold - if confidence is too low, mark as "other"
-        if confidence < self.MIN_CONFIDENCE:
-            return "other", confidence
+        if best_score < self.MIN_CONFIDENCE:
+            return "other", best_score
         
-        return best_class, confidence
+        # Margin check - if winner isn't clearly ahead, classify as "other"
+        if best_score - runner_up_score < self.MARGIN_THRESHOLD:
+            return "other", best_score
+        
+        # Map other_surface to "other" for downstream filtering
+        if best_class == "other_surface":
+            return "other", best_score
+        
+        return best_class, best_score
     
     def classify_masks_batch(
         self, 
