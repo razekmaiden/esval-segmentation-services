@@ -40,12 +40,15 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS configuration for frontend
+# CORS configuration for frontend (dev: allow common local ports)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:3005",
+        "http://127.0.0.1:3005",
+        "http://localhost:3001",
     ],
     allow_credentials=True,
     allow_methods=["*"],
