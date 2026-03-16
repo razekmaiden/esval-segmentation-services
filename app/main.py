@@ -60,6 +60,9 @@ class HealthResponse(BaseModel):
     status: str
     device: dict[str, Any]
     model_loaded: bool
+    model_variant: str = "mobilesam"
+    engine: str = "mobilesam"
+    model_label: str = "MobileSAM"
 
 
 class SegmentRequest(BaseModel):
