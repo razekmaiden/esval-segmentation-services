@@ -30,9 +30,10 @@ class CLIPClassifier:
         ],
         "vegetation": [
             "dense green tree canopy seen from above",
-            "green garden trees and bushes aerial view",
-            "lush green garden foliage from satellite",
-            "thick green vegetation cover from sky"
+            "circular tree crown casting shadow aerial view",
+            "dark green round treetops birds eye view",
+            "garden with trees and bushes from satellite",
+            "thick green foliage with shadows from above"
         ],
         "plantation": [
             "organized rows of crops aerial view",
@@ -41,16 +42,19 @@ class CLIPClassifier:
             "brown cultivated farmland"
         ],
         "building": [
-            "residential house rooftop seen from above",
-            "gray concrete building roof aerial satellite view",
-            "corrugated metal roof of a house from above",
-            "brown or red tile roof from satellite"
+            "flat concrete rooftop slab viewed from above",
+            "corrugated metal zinc roof of a house aerial view",
+            "orange terracotta tile roof aerial satellite",
+            "residential rooftop with water tanks or solar panels from above",
+            "rectangular house roof with chimney or vent aerial view",
+            "urban house roof texture with edges and shadows from satellite"
         ],
         "other_surface": [
-            "gray asphalt road or pavement from above",
-            "bare dry soil or dirt ground aerial view",
-            "concrete parking lot seen from satellite",
-            "unpaved gravel surface from above"
+            "open asphalt road without buildings aerial view",
+            "bare dirt yard without roof or vegetation",
+            "concrete driveway or pathway open air",
+            "gravel lot or unpaved ground without structures",
+            "empty parking area with no roof from above"
         ]
     }
     
@@ -60,7 +64,7 @@ class CLIPClassifier:
     # Confidence thresholds
     MIN_CONFIDENCE = 0.23  # Minimum to be considered valid
     WATER_BONUS = 0.0      # No artificial bias — let raw scores decide
-    MARGIN_THRESHOLD = 0.005  # Winner must beat runner-up by this margin
+    MARGIN_THRESHOLD = 0.001  # Winner must beat runner-up by this margin
     
     def __init__(self, device: str = "cuda"):
         """
