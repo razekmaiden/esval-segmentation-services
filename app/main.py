@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from typing import Any
 import json
 
-from .config import get_device_info, MAX_IMAGE_SIZE
+from .config import get_device_info, MAX_IMAGE_SIZE, SEGMENTATION_ENGINE, SAM2_MODEL_SIZE
 from .segmentation import get_segmentation_service, SegmentationService
 from .utils import (
     load_image_from_bytes,
@@ -24,7 +24,8 @@ from .utils import (
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize the segmentation service on startup."""
-    print("Loading MobileSAM model...")
+    engine_name = "SAM 2" if SEGMENTATION_ENGINE == "sam2" else "MobileSAM"
+    print(f"Loading {engine_name} model...")
     try:
         service = get_segmentation_service()
         print(f"Model ready on {service.device}")
@@ -35,8 +36,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ESVAL Segmentation Service",
-    description="MobileSAM-based image segmentation for satellite imagery",
-    version="1.0.0",
+    description="SAM 2 / MobileSAM image segmentation for satellite imagery",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -60,9 +61,9 @@ class HealthResponse(BaseModel):
     status: str
     device: dict[str, Any]
     model_loaded: bool
-    model_variant: str = "mobilesam"
-    engine: str = "mobilesam"
-    model_label: str = "MobileSAM"
+    model_variant: str = ""
+    engine: str = ""
+    model_label: str = ""
 
 
 class SegmentRequest(BaseModel):
@@ -95,11 +96,23 @@ async def health():
         model_loaded = service.is_ready()
     except Exception:
         model_loaded = False
-    
+
+    # Build model info based on engine
+    engine = SEGMENTATION_ENGINE
+    if engine == "sam2":
+        model_variant = SAM2_MODEL_SIZE
+        model_label = "SAM 2 Small"
+    else:
+        model_variant = "mobilesam"
+        model_label = "MobileSAM"
+
     return HealthResponse(
         status="healthy" if model_loaded else "degraded",
         device=get_device_info(),
-        model_loaded=model_loaded
+        model_loaded=model_loaded,
+        model_variant=model_variant,
+        engine=engine,
+        model_label=model_label
     )
 
 
