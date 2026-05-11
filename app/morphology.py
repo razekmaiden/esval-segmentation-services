@@ -49,9 +49,12 @@ def remove_noise_pixels(
         # Closing fills small holes (dilate then erode)
         closed = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
         
-        # Update only this class's pixels
-        cleaned[class_map == class_id] = 0  # Clear old positions
-        cleaned[closed == 1] = class_id  # Set cleaned positions
+        # Actualizar solo los píxeles de esta clase:
+        # - Quitar los que el opening eliminó (píxeles de ruido)
+        # - NO quitar píxeles que ahora pertenecen a otra clase (dejarlos)
+        removed_by_open = (class_map == class_id) & (closed == 0)
+        cleaned[removed_by_open] = 0  # Eliminar ruido
+        cleaned[closed == 1] = class_id  # Confirmar posiciones limpias
     
     # Step 2: Remove small connected components
     cleaned = _remove_small_components(cleaned, min_region_size)
@@ -169,45 +172,64 @@ def create_class_map_from_masks(
     class_to_id: Optional[dict] = None
 ) -> np.ndarray:
     """
-    Create a unified class map from individual masks.
-    
-    Args:
-        masks: List of mask dictionaries with 'segmentation' and 'classification' keys
-        image_shape: (height, width) of the output class map
-        class_to_id: Optional mapping from class names to IDs
-        
-    Returns:
-        2D class map where each pixel has its class ID
+    Crea un class map unificado a partir de las máscaras individuales.
+
+    Estrategia de procesamiento:
+    - Las máscaras se ordenan por área DESCENDENTE (más grandes primero).
+    - Esto asegura que máscaras pequeñas y específicas (un árbol, una piscina)
+      sobreescriban máscaras grandes y genéricas (toda la propiedad = building).
+    - Además se aplica un sistema de prioridad por clase:
+        water(4) > vegetation(3) > plantation(2) > building(1) > background(0)
+      De modo que vegetación y agua nunca son sobreescritas por construction.
     """
     if class_to_id is None:
         class_to_id = {
-            "water": 1,
+            "water":      1,
             "vegetation": 2,
             "plantation": 3,
-            "building": 4,
-            "other": 0
+            "building":   4,
+            "other":      0
         }
-    
+
+    # Prioridad de clase: cuánto puede overwrite una clase a otra
+    # Más alto = más prioridad = puede sobreescribir clases con prioridad menor
+    class_priority = {
+        "water":      10,  # Agua siempre gana (piscinas)
+        "vegetation": 8,   # Vegetación > construcción: no deja que building overwrite
+        "plantation": 8,   # Plantación mismo nivel que vegetación
+        "building":   2,   # Sólo rellena áreas no clasificadas o con prioridad muy baja
+        "other":      0
+    }
+
     h, w = image_shape
-    class_map = np.zeros((h, w), dtype=np.uint8)
-    
-    # Sort masks by confidence (lower first, so higher confidence overwrites)
+    class_map      = np.zeros((h, w), dtype=np.uint8)
+    priority_map   = np.zeros((h, w), dtype=np.int8)   # prioridad del clasificador actual
+
+    # Ordenar por área DESCENDENTE → grandes primero (rellenan el fondo),
+    # pequeñas después (sobreescriben con más precisión)
     sorted_masks = sorted(
-        masks, 
-        key=lambda m: m.get("confidence", 0)
+        masks,
+        key=lambda m: m.get("area", 0),
+        reverse=True
     )
-    
+
     for mask_data in sorted_masks:
         mask = mask_data.get("segmentation")
         if mask is None:
             continue
-            
+
         class_name = mask_data.get("classification", "other")
-        class_id = class_to_id.get(class_name, 0)
-        
-        if class_id > 0:  # Don't overwrite with background
-            class_map[mask] = class_id
-    
+        class_id   = class_to_id.get(class_name, 0)
+        priority   = class_priority.get(class_name, 0)
+
+        if class_id == 0:
+            continue
+
+        # Sobreescribir solo píxeles donde esta clase tiene mayor o igual prioridad
+        can_overwrite = mask & (priority_map <= priority)
+        class_map[can_overwrite]    = class_id
+        priority_map[can_overwrite] = priority
+
     return class_map
 
 
@@ -216,14 +238,8 @@ def class_map_to_masks(
     id_to_class: Optional[dict] = None
 ) -> list[dict]:
     """
-    Convert a class map back to individual mask dictionaries.
-    
-    Args:
-        class_map: 2D array with class IDs
-        id_to_class: Optional mapping from IDs to class names
-        
-    Returns:
-        List of mask dictionaries with 'segmentation' and 'classification' keys
+    Convierte el class map de vuelta a máscaras individuales por clase.
+    Actualizado para coincidir con el nuevo id→class mapping de create_class_map_from_masks.
     """
     if id_to_class is None:
         id_to_class = {

@@ -23,7 +23,12 @@ from .config import (
     SAM2_MODEL_PATH,
     SAM2_MODEL_SIZE,
     DEFAULT_POINTS_PER_SIDE,
-    MIN_MASK_AREA
+    MIN_MASK_AREA,
+    SAM_PRED_IOU_THRESH,
+    SAM_STABILITY_SCORE_THRESH,
+    SAM_CROP_N_LAYERS,
+    SAM_CROP_OVERLAP_RATIO,
+    SAM_MIN_MASK_AREA,
 )
 from .clip_classifier import get_clip_classifier, CLIPClassifier
 from .morphology import (
@@ -42,12 +47,17 @@ def _build_mobilesam():
     model.eval()
 
     predictor = SamPredictor(model)
+    # Parámetros ajustados para imágenes satelitales de propiedades chilenas.
+    # pred_iou_thresh y stability_score_thresh bajados para generar más máscaras.
+    # crop_n_layers=1 detecta features pequeños que el grid global pierde.
     auto_generator = SamAutomaticMaskGenerator(
         model,
         points_per_side=DEFAULT_POINTS_PER_SIDE,
-        pred_iou_thresh=0.86,
-        stability_score_thresh=0.92,
-        min_mask_region_area=MIN_MASK_AREA
+        pred_iou_thresh=SAM_PRED_IOU_THRESH,
+        stability_score_thresh=SAM_STABILITY_SCORE_THRESH,
+        crop_n_layers=SAM_CROP_N_LAYERS,
+        crop_overlap_ratio=SAM_CROP_OVERLAP_RATIO,
+        min_mask_region_area=SAM_MIN_MASK_AREA,
     )
 
     return model, predictor, auto_generator
@@ -225,39 +235,81 @@ class SegmentationService:
 
         # Step 3: Apply morphological post-processing
         if apply_morphology and len(classified_masks) > 0:
-            classified_masks = self._apply_morphology(classified_masks, image.shape[:2])
+            classified_masks = self._apply_morphology(classified_masks, image.shape[:2], image)
             print(f"After morphology: {len(classified_masks)} clean masks")
 
         return classified_masks
     
     def _apply_morphology(
-        self, 
-        masks: list[dict[str, Any]], 
-        image_shape: tuple[int, int]
+        self,
+        masks: list[dict[str, Any]],
+        image_shape: tuple[int, int],
+        image: np.ndarray | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Apply morphological post-processing to remove noisy pixels.
-        
-        Args:
-            masks: List of classified mask dictionaries
-            image_shape: (height, width) of the image
-            
-        Returns:
-            Cleaned mask dictionaries
+        Aplica post-procesamiento morfológico para limpiar píxeles ruidosos.
+
+        Pipeline:
+        1. Crear class map unificado (máscaras grandes primero, prioridad vegetal > building)
+        2. Limpieza morfológica (erosión/dilatación con kernel pequeño)
+        3. Rellenar píxeles no clasificados (0) por vecino más cercano
+        4. Corrección pixel-a-pixel: reclasificar píxeles de edificio que son vegetación
+        5. Convertir de vuelta a máscaras por clase
         """
-        # Create unified class map from all masks
+        # 1. Construir class map con sistema de prioridad correcto
         class_map = create_class_map_from_masks(masks, image_shape)
-        
-        # Remove noise
+
+        # 2. Limpieza morfológica ligera
         cleaned_map = remove_noise_pixels(
-            class_map, 
-            min_region_size=50,
-            kernel_size=5
+            class_map,
+            min_region_size=30,
+            kernel_size=3
         )
-        
-        # Convert back to mask format
+
+        # 3. Rellenar píxeles no clasificados (0) que quedaron tras la erosión.
+        #    Se usa distance_transform_edt para asignar a cada píxel 0 el valor
+        #    del píxel clasificado más cercano (nearest-neighbor fill).
+        unclassified = cleaned_map == 0
+        if unclassified.any() and (cleaned_map > 0).any():
+            from scipy.ndimage import distance_transform_edt
+            _, indices = distance_transform_edt(unclassified, return_indices=True)
+            cleaned_map[unclassified] = cleaned_map[indices[0][unclassified],
+                                                     indices[1][unclassified]]
+
+        # 4. Corrección pixel-a-pixel de vegetación.
+        #    SAM clasifica por máscara (un segmento = una clase). Si un segmento
+        #    mezcla edificio y vegetación, se etiqueta como edificio (residual).
+        #    Este paso reclasifica individualmente los píxeles de edificio que
+        #    tienen firma espectral de vegetación (ExG alto + relación verde alta).
+        if image is not None:
+            BUILDING_ID   = 4  # según create_class_map_from_masks
+            VEGETATION_ID = 2
+            building_mask = cleaned_map == BUILDING_ID
+            if building_mask.any():
+                r = image[:, :, 0].astype(np.float32)
+                g = image[:, :, 1].astype(np.float32)
+                b = image[:, :, 2].astype(np.float32)
+                exg = 2 * g - r - b
+                denom = r + g + b
+                green_ratio = np.where(denom > 0, g / denom, 0.0)
+
+                # Criterio conservador: ExG fuerte + dominancia verde clara
+                is_veg = (exg > 5) & (green_ratio > 0.33)
+                # Criterio alternativo con umbral más suave pero señal verde neta
+                is_veg |= (exg > 3) & (green_ratio > 0.34)
+                # Criterio amplio: cualquier píxel con verde dominante sobre rojo
+                is_veg |= (exg > 1) & (green_ratio > 0.35)
+
+                # Solo reclasificar píxeles que estaban marcados como edificio
+                reclassify = building_mask & is_veg
+                cleaned_map[reclassify] = VEGETATION_ID
+                n_reclassified = int(reclassify.sum())
+                if n_reclassified > 0:
+                    print(f"Pixel correction: {n_reclassified} building pixels reclassified as vegetation")
+
+        # 5. Convertir class map → lista de máscaras por clase
         cleaned_masks = class_map_to_masks(cleaned_map)
-        
+
         return cleaned_masks
     
     def _classify_mask(
@@ -266,63 +318,110 @@ class SegmentationService:
         mask: np.ndarray
     ) -> tuple[str, float]:
         """
-        Classify a mask using CLIP (preferred) or HSV fallback.
-        
-        Args:
-            image: Original RGB image
-            mask: Binary mask array
-            
-        Returns:
-            Tuple of (classification string, confidence score)
+        Clasifica una máscara usando CLIP (preferido) con fallback a HSV.
+
+        CLIP es más semántico pero puede devolver "other" cuando la confianza
+        es baja (imagen muy pequeña, colores ambiguos).  En ese caso se usa HSV
+        como clasificador de respaldo en lugar de descartar la máscara.
         """
-        # Use CLIP if available
         if self.clip_classifier is not None:
-            return self.clip_classifier.classify_mask(image, mask)
-        
-        # Fallback to HSV classification
+            cls, conf = self.clip_classifier.classify_mask(image, mask)
+            # Si CLIP produce una clase válida, usarla directamente
+            if cls != "other":
+                return cls, conf
+            # CLIP no pudo clasificar → intentar con HSV antes de descartar
+
         return self._classify_mask_hsv(image, mask)
     
     def _classify_mask_hsv(
-        self, 
-        image: np.ndarray, 
+        self,
+        image: np.ndarray,
         mask: np.ndarray
     ) -> tuple[str, float]:
         """
-        Fallback HSV-based classification.
-        
-        Args:
-            image: Original RGB image
-            mask: Binary mask array
-            
-        Returns:
-            Tuple of (classification string, confidence score)
+        Clasificación HSV robusta para imágenes satelitales chilenas.
+
+        Estrategia:
+          1. Vegetación: detección por ExG (Excess Green Index) y ratio de verde.
+             Cubre tanto verde brillante (jardines) como verde oliva oscuro
+             (árboles desde arriba, H≈25-45 en OpenCV).
+          2. Agua/piscina: azul dominante con saturación y brillo altos.
+          3. Construcción: categoría residual para todo lo que no es vegetación
+             ni agua. Abarca techos grises, naranjas, marrones, metal, concreto.
+
+        No se clasifica nada como "other": un pixel dentro del predio que no es
+        vegetación ni agua muy probablemente es construcción u otra superficie.
         """
-        from .config import ZONE_COLOR_RANGES
-        
-        # Extract masked region
         masked_pixels = image[mask]
-        if len(masked_pixels) == 0:
+        if len(masked_pixels) < 10:
             return "other", 0.0
-        
-        # Convert to HSV for color classification
-        mean_color = masked_pixels.mean(axis=0).astype(np.uint8)
-        hsv_color = cv2.cvtColor(np.array([[mean_color]]), cv2.COLOR_RGB2HSV)[0][0]
-        
-        h, s, v = hsv_color
-        
-        # Check against each zone's color range
-        for zone_type, ranges in ZONE_COLOR_RANGES.items():
-            h_min, h_max = ranges["hue_range"]
-            s_min, s_max = ranges["sat_range"]
-            v_min, v_max = ranges["val_range"]
-            
-            if (h_min <= h <= h_max and 
-                s_min <= s <= s_max and 
-                v_min <= v <= v_max):
-                # HSV doesn't provide real confidence, use 0.5 as default
-                return zone_type, 0.5
-        
-        return "other", 0.0
+
+        avg = masked_pixels.mean(axis=0)
+        r, g, b = float(avg[0]), float(avg[1]), float(avg[2])
+        total = r + g + b + 1e-6
+
+        # ── Índices colorimétricos ──────────────────────────────────────────
+        green_ratio = g / total
+        blue_ratio  = b / total
+        exg = 2 * g - r - b            # Excess Green Index
+
+        # HSV promedio de los píxeles de la máscara
+        bgr_pixels = masked_pixels[:, ::-1].copy().reshape(-1, 1, 3).astype(np.uint8)
+        hsv_pixels = cv2.cvtColor(bgr_pixels, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(float)
+        h_mean = hsv_pixels[:, 0].mean()   # OpenCV H: 0-179
+        s_mean = hsv_pixels[:, 1].mean()   # 0-255
+        v_mean = hsv_pixels[:, 2].mean()   # 0-255
+        s_std  = hsv_pixels[:, 1].std()
+
+        # ── 1. VEGETACIÓN ──────────────────────────────────────────────────
+        # Criterio A: ExG alto → señal de clorofila clara (jardines irrigados)
+        if exg > 5 and green_ratio > 0.33:
+            n = len(masked_pixels)
+            if n > 50:
+                color_std = masked_pixels.std(axis=0).mean()
+                if color_std < 18 and s_mean > 45:
+                    return "plantation", 0.7  # vegetación uniforme → plantación
+            return "vegetation", 0.7
+
+        # Criterio B: ExG moderado con dominancia verde y brillo suficiente
+        if exg > 3 and green_ratio > 0.34 and g > r and v_mean > 50:
+            return "vegetation", 0.6
+
+        # Criterio C: Verde oliva / oscuro (H=20-55 en OpenCV, s baja)
+        # Captura árboles desde arriba cuyo tono es marrón-verde (H≈25-45)
+        if 20 <= h_mean <= 55 and s_mean > 15 and g > r and green_ratio > 0.32:
+            return "vegetation", 0.6
+
+        # Criterio D: Verde dominante en RGB sin señal HSV fuerte
+        if g > r and g > b and green_ratio > 0.34:
+            if s_mean > 12 or (g > 55 and exg > 2):
+                return "vegetation", 0.55
+
+        # Criterio E: Verde pálido / seco, brillo alto (pasto seco de verano)
+        if exg > 1 and green_ratio > 0.35 and v_mean > 85 and g > r:
+            return "vegetation", 0.5
+
+        # ── 2. AGUA / PISCINA ──────────────────────────────────────────────
+        # Piscinas: azul claro bien saturado, NO demasiado oscuro
+        is_water = False
+        if 90 <= h_mean <= 130 and s_mean > 70 and v_mean > 90:
+            is_water = True
+        if blue_ratio > 0.42 and b > r * 1.3 and b > g * 1.2 and s_mean > 50 and v_mean > 80:
+            is_water = True
+        # Rechazar agua oscura (sombras/techos oscuros)
+        if is_water and v_mean < 75:
+            is_water = False
+        # Rechazar agua no uniforme (las piscinas tienen color muy uniforme)
+        if is_water and s_std > 45:
+            is_water = False
+        if is_water:
+            return "water", 0.8
+
+        # ── 3. CONSTRUCCIÓN (residual) ─────────────────────────────────────
+        # Todo lo que no es vegetación ni agua se clasifica como construcción.
+        # Esto abarca: techos grises, rojos/naranjas, metálicos, pavimento,
+        # concreto, asfalto. Es la categoría dominante en zonas urbanas.
+        return "building", 0.5
 
 
 # Global service instance

@@ -58,9 +58,13 @@ class CLIPClassifier:
     TARGET_CLASSES = {"water", "vegetation", "plantation", "building"}
     
     # Confidence thresholds
-    MIN_CONFIDENCE = 0.23  # Minimum to be considered valid
-    WATER_BONUS = 0.0      # No artificial bias — let raw scores decide
-    MARGIN_THRESHOLD = 0.005  # Winner must beat runner-up by this margin
+    # MIN_CONFIDENCE bajado de 0.23 → 0.18: imágenes satelitales pequeñas
+    # producen scores CLIP menores que imágenes naturales terrestres.
+    # MARGIN_THRESHOLD bajado de 0.005 → 0.002: margen suficiente para discriminar
+    # sin rechazar casos ambiguos válidos.
+    MIN_CONFIDENCE = 0.18
+    WATER_BONUS = 0.0      # Sin sesgo artificial
+    MARGIN_THRESHOLD = 0.002
     
     def __init__(self, device: str = "cuda"):
         """

@@ -66,25 +66,58 @@ MODEL_TYPE = MOBILE_SAM_TYPE if SEGMENTATION_ENGINE == "mobilesam" else SAM2_MOD
 
 # API configuration
 MAX_IMAGE_SIZE = 2048  # Maximum image dimension
-DEFAULT_POINTS_PER_SIDE = 32  # For auto-mask generation
-MIN_MASK_AREA = 100  # Minimum mask area in pixels
+MIN_MASK_AREA = 100    # Minimum mask area in pixels
 
-# Zone classification colors (HSV ranges for detection)
-# These correspond to the zone types in the frontend
+# ── MobileSAM automatic mask generator parameters ───────────────────────────
+# Ajustados para imágenes satelitales de propiedades chilenas (zoom alto,
+# áreas pequeñas, vegetación de tono verde-oliva poco saturado).
+#
+# Cambios respecto a valores originales:
+#   pred_iou_thresh 0.86 → 0.65  : más máscaras pasan el filtro de IoU
+#   stability_score_thresh 0.92 → 0.70 : menos estricto → más cobertura
+#   crop_n_layers 0 → 1          : sub-crops detectan features más pequeños
+#   crop_overlap_ratio 0.3       : solapamiento entre crops
+#   points_per_side 32 → 32      : sin cambio, densidad suficiente
+DEFAULT_POINTS_PER_SIDE    = 32
+SAM_PRED_IOU_THRESH        = 0.65
+SAM_STABILITY_SCORE_THRESH = 0.70
+SAM_CROP_N_LAYERS          = 1
+SAM_CROP_OVERLAP_RATIO     = 0.3
+SAM_MIN_MASK_AREA          = 50   # más pequeño que MIN_MASK_AREA para SAM interno
+
+# ── Rangos HSV para clasificación de respaldo (cuando CLIP falla) ────────────
+# Escala OpenCV: H∈[0,179], S∈[0,255], V∈[0,255]
+#
+# Vegetación en imágenes satelitales chilenas:
+#   - Verde brillante (jardines irrigados): H≈60, S>80
+#   - Verde oliva / oscuro (árboles desde arriba): H≈25-45, S=30-100
+#   - Rango ampliado: H=(20,85) para capturar ambos tonos
+#
+# Construcción: NO se detecta por rango HSV positivo; es la categoría residual.
+# Todo lo que no sea agua, vegetación ni plantación → building (ver _classify_mask_hsv).
 ZONE_COLOR_RANGES = {
     "water": {
-        "hue_range": (90, 130),      # Blue tones
-        "sat_range": (50, 255),
-        "val_range": (50, 255)
+        # Agua/piscinas: azul brillante, alta saturación
+        "hue_range": (90, 130),
+        "sat_range": (60, 255),
+        "val_range": (80, 255)
     },
     "vegetation": {
-        "hue_range": (35, 85),       # Green tones
+        # Verde brillante de jardines: H=40-85, saturación media-alta
+        "hue_range": (40, 85),
         "sat_range": (40, 255),
         "val_range": (40, 255)
     },
+    "vegetation_olive": {
+        # Verde oliva oscuro de árboles/arbustos desde arriba: H=20-45, sat baja
+        "hue_range": (20, 45),
+        "sat_range": (15, 130),
+        "val_range": (30, 160)
+    },
     "plantation": {
-        "hue_range": (20, 45),       # Brown/yellow-green tones (cultivated)
-        "sat_range": (30, 200),
+        # Cultivos en hileras, tono marrón-amarillento
+        "hue_range": (10, 30),
+        "sat_range": (40, 200),
         "val_range": (60, 200)
     }
 }
@@ -92,9 +125,9 @@ ZONE_COLOR_RANGES = {
 # Class priority for overlap resolution (higher number = higher priority)
 # Water wins over everything (pools should not be classified as vegetation)
 CLASS_PRIORITY = {
-    "water": 4,       # Highest - pools/water always win
-    "building": 3,    # Second - clear structures
-    "plantation": 2,  # Third - organized crops
-    "vegetation": 1,  # Lowest - residual/default category
+    "water": 4,        # Highest - pools/water siempre ganan
+    "vegetation": 3,   # Second - vegetación prevalece sobre edificio (edificio = residual)
+    "plantation": 3,   # Equal to vegetation
+    "building": 2,     # Lower - residual de lo que no es agua/vegetación
     "other": 0
 }
