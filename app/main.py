@@ -11,7 +11,7 @@ from typing import Any
 import json
 
 from .config import get_device_info, MAX_IMAGE_SIZE, SEGMENTATION_ENGINE, SAM2_MODEL_SIZE
-from .segmentation import get_segmentation_service, SegmentationService
+from .segmentation import get_segmentation_service, reload_segmentation_service, SegmentationService
 from .utils import (
     load_image_from_bytes,
     resize_image_if_needed,
@@ -79,6 +79,10 @@ class BoundsInput(BaseModel):
     west: float
 
 
+class SwitchModelRequest(BaseModel):
+    model: str  # 'mobilesam' or 'sam2_hiera_small'
+
+
 class SegmentationResponse(BaseModel):
     features: list[dict[str, Any]]
     device_used: str
@@ -94,11 +98,12 @@ async def health():
     try:
         service = get_segmentation_service()
         model_loaded = service.is_ready()
+        engine = service._engine  # Always reflect the currently loaded engine
     except Exception:
         model_loaded = False
+        engine = SEGMENTATION_ENGINE
 
     # Build model info based on engine
-    engine = SEGMENTATION_ENGINE
     if engine == "sam2":
         model_variant = SAM2_MODEL_SIZE
         model_label = "SAM 2 Small"
@@ -277,12 +282,62 @@ async def auto_segment(
     )
 
 
+@app.post("/switch-model")
+async def switch_model(request: SwitchModelRequest):
+    """
+    Dynamically switch the active segmentation model.
+    Reloads the service in-process with the new engine.
+
+    Accepted model IDs:
+      - 'mobilesam'        → MobileSAM (9.6M params, faster)
+      - 'sam2_hiera_small' → SAM 2 Small (46M params, more accurate)
+    """
+    model_to_engine = {
+        "mobilesam": "mobilesam",
+        "sam2_hiera_small": "sam2",
+    }
+
+    engine = model_to_engine.get(request.model)
+    if engine is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{request.model}'. Valid options: {list(model_to_engine.keys())}"
+        )
+
+    try:
+        from .config import get_device_info, SAM2_MODEL_SIZE
+        service = reload_segmentation_service(engine)
+
+        if engine == "sam2":
+            model_variant = SAM2_MODEL_SIZE
+            model_label = "SAM 2 Small"
+        else:
+            model_variant = "mobilesam"
+            model_label = "MobileSAM"
+
+        return {
+            "status": "switched",
+            "model": request.model,
+            "engine": engine,
+            "model_variant": model_variant,
+            "model_label": model_label,
+            "model_loaded": service.is_ready(),
+            "device": get_device_info(),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to switch model: {e}"
+        )
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
     return {
         "service": "ESVAL Segmentation Service",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "switch_model": "/switch-model"
     }

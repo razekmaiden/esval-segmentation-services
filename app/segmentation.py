@@ -74,11 +74,13 @@ def _build_sam2():
     model = build_sam2(model_cfg, checkpoint, device=get_device())
 
     # SAM 2 automatic mask generator
+    # Thresholds tuned for satellite/aerial imagery:
+    # Lower thresholds vs MobileSAM defaults to achieve comparable coverage (45%+ vs 14%)
     auto_generator = SAM2AutomaticMaskGenerator(
         model,
         points_per_side=DEFAULT_POINTS_PER_SIDE,
-        pred_iou_thresh=0.86,
-        stability_score_thresh=0.92,
+        pred_iou_thresh=0.80,
+        stability_score_thresh=0.86,
         min_mask_region_area=MIN_MASK_AREA
     )
 
@@ -91,7 +93,7 @@ class SegmentationService:
     Supports both prompted (point/box) and automatic segmentation.
     """
 
-    def __init__(self):
+    def __init__(self, engine: str | None = None):
         self.device = get_device()
         self.model = None
         self.predictor = None
@@ -99,7 +101,7 @@ class SegmentationService:
         self.clip_classifier: CLIPClassifier | None = None
         self._is_ready = False
         self._use_clip = True  # Toggle for CLIP vs HSV classification
-        self._engine = SEGMENTATION_ENGINE
+        self._engine = engine if engine is not None else SEGMENTATION_ENGINE
 
     def load_model(self) -> None:
         """Load the segmentation model and initialize predictors."""
@@ -335,4 +337,13 @@ def get_segmentation_service() -> SegmentationService:
     if _service is None:
         _service = SegmentationService()
         _service.load_model()
+    return _service
+
+
+def reload_segmentation_service(engine: str) -> SegmentationService:
+    """Destroy the current singleton and reload with a new engine."""
+    global _service
+    _service = None
+    _service = SegmentationService(engine=engine)
+    _service.load_model()
     return _service
