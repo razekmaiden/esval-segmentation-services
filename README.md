@@ -1,6 +1,6 @@
-# ESVAL Segmentation Service
+# Policía del agua - ESVAL Segmentation Service
 
-Microservicio de segmentación semántica de imágenes satelitales para la plataforma ESVAL.  
+Microservicio de segmentación semántica de imágenes satelitales para la plataforma Policía del agua - ESVAL.  
 Provee una API REST (FastAPI) que combina **MobileSAM / SAM 2 Small** para segmentación de máscaras con **CLIP** para clasificación semántica de superficies (vegetación, agua, plantación, construcción).
 
 ---
