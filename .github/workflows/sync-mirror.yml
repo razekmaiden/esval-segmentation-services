@@ -1,0 +1,25 @@
+name: Sync Mirror (Innervycs)
+
+on:
+  push:
+    branches: [runpod-implementation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish-mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: runpod-implementation
+          fetch-depth: 1
+
+      - name: Publish to Innervycs mirror
+        env:
+          MIRROR_GITHUB_TOKEN: ${{ secrets.MIRROR_SYNC_PAT }}
+        run: |
+          chmod +x scripts/publish-mirror.sh
+          ./scripts/publish-mirror.sh
