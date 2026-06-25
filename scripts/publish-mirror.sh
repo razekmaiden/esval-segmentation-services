@@ -44,6 +44,7 @@ rsync -a \
     --exclude '.pytest_cache' \
     --exclude 'scripts/publish-mirror.sh' \
     --exclude 'scripts/mirror' \
+    --exclude 'docs/operations/MIRROR_SYNC.md' \
     --exclude '.github/workflows/sync-mirror.yml' \
     "$ROOT/" "$WORKDIR/"
 
