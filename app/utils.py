@@ -117,6 +117,70 @@ def mask_to_polygon(
     return polygons
 
 
+def geo_to_pixel(
+    lat: float,
+    lng: float,
+    bounds: dict[str, float],
+    image_size: tuple[int, int],
+) -> tuple[float, float]:
+    """
+    Convert geographic coordinates to pixel coordinates in the image.
+
+    Args:
+        lat: Latitude (WGS84)
+        lng: Longitude (WGS84)
+        bounds: Dictionary with north, south, east, west
+        image_size: Tuple of (width, height) in pixels
+
+    Returns:
+        Tuple of (x, y) pixel coordinates
+    """
+    width, height = image_size
+    lng_span = bounds["east"] - bounds["west"]
+    lat_span = bounds["north"] - bounds["south"]
+    if lng_span == 0 or lat_span == 0:
+        raise ValueError("Invalid bounds: zero geographic span")
+
+    x = (lng - bounds["west"]) / lng_span * width
+    y = (bounds["north"] - lat) / lat_span * height
+
+    x = max(0.0, min(float(width - 1), x))
+    y = max(0.0, min(float(height - 1), y))
+    return x, y
+
+
+def polygon_area_m2(geometry: dict[str, Any]) -> float:
+    """
+    Compute geodesic area in m² for a GeoJSON geometry in EPSG:4326.
+    """
+    from shapely.geometry import shape
+    from pyproj import Geod
+
+    geod = Geod(ellps="WGS84")
+    geom = shape(geometry)
+    total = 0.0
+
+    if geom.geom_type == "Polygon":
+        lons, lats = geom.exterior.coords.xy
+        area, _ = geod.polygon_area_perimeter(list(lons), list(lats))
+        total = abs(area)
+        for interior in geom.interiors:
+            lons_h, lats_h = interior.coords.xy
+            hole_area, _ = geod.polygon_area_perimeter(list(lons_h), list(lats_h))
+            total -= abs(hole_area)
+    elif geom.geom_type == "MultiPolygon":
+        for poly in geom.geoms:
+            lons, lats = poly.exterior.coords.xy
+            area, _ = geod.polygon_area_perimeter(list(lons), list(lats))
+            total += abs(area)
+            for interior in poly.interiors:
+                lons_h, lats_h = interior.coords.xy
+                hole_area, _ = geod.polygon_area_perimeter(list(lons_h), list(lats_h))
+                total -= abs(hole_area)
+
+    return abs(total)
+
+
 def pixel_coords_to_geo(
     pixel_coords: list[list[float]],
     bounds: dict[str, float],

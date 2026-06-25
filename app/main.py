@@ -17,7 +17,11 @@ from .utils import (
     resize_image_if_needed,
     masks_to_geojson,
     merge_overlapping_masks,
-    clip_features_to_geometry
+    clip_features_to_geometry,
+    geo_to_pixel,
+    mask_to_polygon,
+    pixel_coords_to_geo,
+    polygon_area_m2,
 )
 
 
@@ -86,6 +90,13 @@ class SwitchModelRequest(BaseModel):
 class SegmentationResponse(BaseModel):
     features: list[dict[str, Any]]
     device_used: str
+    processing_time_ms: float
+
+
+class DetectRegionResponse(BaseModel):
+    region: dict[str, Any] | None
+    area_m2: float
+    current_class: str
     processing_time_ms: float
 
 
@@ -282,6 +293,118 @@ async def auto_segment(
     )
 
 
+@app.post("/detect-region", response_model=DetectRegionResponse)
+async def detect_region(
+    image: UploadFile = File(...),
+    bounds: str = Form(...),
+    point: str = Form(...),
+    clip_geometry: str | None = Form(None),
+):
+    """
+    Detect the connected region at a map click for AI-assisted relabeling.
+
+    Uses SAM point prompting + CLIP classification on the selected mask.
+    """
+    import time
+    start_time = time.time()
+
+    try:
+        service = get_segmentation_service()
+        if not service.is_ready():
+            raise HTTPException(503, "Model not loaded")
+    except Exception as e:
+        raise HTTPException(503, f"Segmentation service unavailable: {e}")
+
+    try:
+        parsed_bounds = json.loads(bounds)
+        point_latlon = json.loads(point)
+        if not isinstance(point_latlon, list) or len(point_latlon) != 2:
+            raise ValueError("point must be [lat, lng]")
+        lat, lng = float(point_latlon[0]), float(point_latlon[1])
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        raise HTTPException(400, f"Invalid bounds or point: {e}")
+
+    parsed_clip_geometry = None
+    if clip_geometry:
+        try:
+            parsed_clip_geometry = json.loads(clip_geometry)
+        except json.JSONDecodeError:
+            pass
+
+    image_bytes = await image.read()
+    img_array = load_image_from_bytes(image_bytes)
+    img_array, _scale = resize_image_if_needed(img_array, MAX_IMAGE_SIZE)
+    h, w = img_array.shape[:2]
+
+    try:
+        px, py = geo_to_pixel(lat, lng, parsed_bounds, (w, h))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    masks, scores = service.segment_with_prompts(
+        img_array,
+        points=[[px, py]],
+        point_labels=[1],
+    )
+
+    empty_response = {
+        "region": None,
+        "area_m2": 0.0,
+        "current_class": "other",
+        "processing_time_ms": round((time.time() - start_time) * 1000, 2),
+    }
+
+    if masks is None or len(masks) == 0:
+        return empty_response
+
+    best_idx = int(scores.argmax())
+    best_mask = masks[best_idx]
+    if best_mask.ndim == 3:
+        best_mask = best_mask[0]
+    best_mask = best_mask.astype(bool)
+
+    classification, _confidence = service._classify_mask(img_array, best_mask)
+
+    pixel_polygons = mask_to_polygon(best_mask)
+    if not pixel_polygons:
+        empty_response["current_class"] = classification
+        empty_response["processing_time_ms"] = round((time.time() - start_time) * 1000, 2)
+        return empty_response
+
+    largest_ring = max(pixel_polygons, key=len)
+    geo_coords = pixel_coords_to_geo(largest_ring, parsed_bounds, (w, h))
+    geometry: dict[str, Any] = {
+        "type": "Polygon",
+        "coordinates": [geo_coords],
+    }
+
+    if parsed_clip_geometry:
+        feature = {
+            "type": "Feature",
+            "properties": {"classification": classification},
+            "geometry": geometry,
+        }
+        clipped = clip_features_to_geometry([feature], parsed_clip_geometry)
+        if not clipped:
+            return {
+                "region": None,
+                "area_m2": 0.0,
+                "current_class": classification,
+                "processing_time_ms": round((time.time() - start_time) * 1000, 2),
+            }
+        geometry = clipped[0]["geometry"]
+
+    area_m2 = polygon_area_m2(geometry)
+    processing_time = (time.time() - start_time) * 1000
+
+    return DetectRegionResponse(
+        region=geometry,
+        area_m2=round(area_m2, 2),
+        current_class=classification,
+        processing_time_ms=round(processing_time, 2),
+    )
+
+
 @app.post("/switch-model")
 async def switch_model(request: SwitchModelRequest):
     """
@@ -339,5 +462,6 @@ async def root():
         "version": "2.0.0",
         "docs": "/docs",
         "health": "/health",
-        "switch_model": "/switch-model"
+        "detect_region": "/detect-region",
+        "switch_model": "/switch-model",
     }

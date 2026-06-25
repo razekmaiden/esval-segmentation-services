@@ -231,7 +231,32 @@ Segmentación guiada con puntos de prompt o bounding box.
 
 ### `POST /detect-region`
 
-Alias de `/segment` optimizado para detección por punto único.
+Detecta la región conectada en un punto del mapa (re-etiquetado asistido por IA).
+
+**Request** (multipart/form-data):
+
+| Campo | Tipo | Descripción |
+|---|---|---|
+| `image` | file | Imagen PNG del mapa |
+| `bounds` | JSON string | `{north, south, east, west}` |
+| `point` | JSON string | `[lat, lng]` del clic |
+| `clip_geometry` | JSON string | GeoJSON geometry opcional (límite de propiedad) |
+
+**Response**:
+
+```json
+{
+  "region": {
+    "type": "Polygon",
+    "coordinates": [[[lng, lat], ...]]
+  },
+  "area_m2": 125.4,
+  "current_class": "vegetation",
+  "processing_time_ms": 842.1
+}
+```
+
+Si no se detecta región válida, `region` es `null` y `area_m2` es `0`.
 
 ---
 

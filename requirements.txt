@@ -24,6 +24,7 @@ git+https://github.com/facebookresearch/sam2.git
 
 # Geometry processing
 shapely>=2.0.0
+pyproj>=3.6.0
 
 # CLIP for semantic classification
 transformers>=4.36.0
