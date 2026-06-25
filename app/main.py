@@ -10,21 +10,26 @@ from pydantic import BaseModel
 from typing import Any
 import json
 
-from .config import get_device_info, MAX_IMAGE_SIZE
-from .segmentation import get_segmentation_service, SegmentationService
+from .config import get_device_info, MAX_IMAGE_SIZE, SEGMENTATION_ENGINE, SAM2_MODEL_SIZE
+from .segmentation import get_segmentation_service, reload_segmentation_service, SegmentationService
 from .utils import (
     load_image_from_bytes,
     resize_image_if_needed,
     masks_to_geojson,
     merge_overlapping_masks,
-    clip_features_to_geometry
+    clip_features_to_geometry,
+    geo_to_pixel,
+    mask_to_polygon,
+    pixel_coords_to_geo,
+    polygon_area_m2,
 )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize the segmentation service on startup."""
-    print("Loading MobileSAM model...")
+    engine_name = "SAM 2" if SEGMENTATION_ENGINE == "sam2" else "MobileSAM"
+    print(f"Loading {engine_name} model...")
     try:
         service = get_segmentation_service()
         print(f"Model ready on {service.device}")
@@ -35,8 +40,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ESVAL Segmentation Service",
-    description="MobileSAM-based image segmentation for satellite imagery",
-    version="1.0.0",
+    description="SAM 2 / MobileSAM image segmentation for satellite imagery",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -60,9 +65,9 @@ class HealthResponse(BaseModel):
     status: str
     device: dict[str, Any]
     model_loaded: bool
-    model_variant: str = "mobilesam"
-    engine: str = "mobilesam"
-    model_label: str = "MobileSAM"
+    model_variant: str = ""
+    engine: str = ""
+    model_label: str = ""
 
 
 class SegmentRequest(BaseModel):
@@ -78,9 +83,20 @@ class BoundsInput(BaseModel):
     west: float
 
 
+class SwitchModelRequest(BaseModel):
+    model: str  # 'mobilesam' or 'sam2_hiera_small'
+
+
 class SegmentationResponse(BaseModel):
     features: list[dict[str, Any]]
     device_used: str
+    processing_time_ms: float
+
+
+class DetectRegionResponse(BaseModel):
+    region: dict[str, Any] | None
+    area_m2: float
+    current_class: str
     processing_time_ms: float
 
 
@@ -93,13 +109,26 @@ async def health():
     try:
         service = get_segmentation_service()
         model_loaded = service.is_ready()
+        engine = service._engine  # Always reflect the currently loaded engine
     except Exception:
         model_loaded = False
-    
+        engine = SEGMENTATION_ENGINE
+
+    # Build model info based on engine
+    if engine == "sam2":
+        model_variant = SAM2_MODEL_SIZE
+        model_label = "SAM 2 Small"
+    else:
+        model_variant = "mobilesam"
+        model_label = "MobileSAM"
+
     return HealthResponse(
         status="healthy" if model_loaded else "degraded",
         device=get_device_info(),
-        model_loaded=model_loaded
+        model_loaded=model_loaded,
+        model_variant=model_variant,
+        engine=engine,
+        model_label=model_label
     )
 
 
@@ -264,12 +293,175 @@ async def auto_segment(
     )
 
 
+@app.post("/detect-region", response_model=DetectRegionResponse)
+async def detect_region(
+    image: UploadFile = File(...),
+    bounds: str = Form(...),
+    point: str = Form(...),
+    clip_geometry: str | None = Form(None),
+):
+    """
+    Detect the connected region at a map click for AI-assisted relabeling.
+
+    Uses SAM point prompting + CLIP classification on the selected mask.
+    """
+    import time
+    start_time = time.time()
+
+    try:
+        service = get_segmentation_service()
+        if not service.is_ready():
+            raise HTTPException(503, "Model not loaded")
+    except Exception as e:
+        raise HTTPException(503, f"Segmentation service unavailable: {e}")
+
+    try:
+        parsed_bounds = json.loads(bounds)
+        point_latlon = json.loads(point)
+        if not isinstance(point_latlon, list) or len(point_latlon) != 2:
+            raise ValueError("point must be [lat, lng]")
+        lat, lng = float(point_latlon[0]), float(point_latlon[1])
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        raise HTTPException(400, f"Invalid bounds or point: {e}")
+
+    parsed_clip_geometry = None
+    if clip_geometry:
+        try:
+            parsed_clip_geometry = json.loads(clip_geometry)
+        except json.JSONDecodeError:
+            pass
+
+    image_bytes = await image.read()
+    img_array = load_image_from_bytes(image_bytes)
+    img_array, _scale = resize_image_if_needed(img_array, MAX_IMAGE_SIZE)
+    h, w = img_array.shape[:2]
+
+    try:
+        px, py = geo_to_pixel(lat, lng, parsed_bounds, (w, h))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    masks, scores = service.segment_with_prompts(
+        img_array,
+        points=[[px, py]],
+        point_labels=[1],
+    )
+
+    empty_response = {
+        "region": None,
+        "area_m2": 0.0,
+        "current_class": "other",
+        "processing_time_ms": round((time.time() - start_time) * 1000, 2),
+    }
+
+    if masks is None or len(masks) == 0:
+        return empty_response
+
+    best_idx = int(scores.argmax())
+    best_mask = masks[best_idx]
+    if best_mask.ndim == 3:
+        best_mask = best_mask[0]
+    best_mask = best_mask.astype(bool)
+
+    classification, _confidence = service._classify_mask(img_array, best_mask)
+
+    pixel_polygons = mask_to_polygon(best_mask)
+    if not pixel_polygons:
+        empty_response["current_class"] = classification
+        empty_response["processing_time_ms"] = round((time.time() - start_time) * 1000, 2)
+        return empty_response
+
+    largest_ring = max(pixel_polygons, key=len)
+    geo_coords = pixel_coords_to_geo(largest_ring, parsed_bounds, (w, h))
+    geometry: dict[str, Any] = {
+        "type": "Polygon",
+        "coordinates": [geo_coords],
+    }
+
+    if parsed_clip_geometry:
+        feature = {
+            "type": "Feature",
+            "properties": {"classification": classification},
+            "geometry": geometry,
+        }
+        clipped = clip_features_to_geometry([feature], parsed_clip_geometry)
+        if not clipped:
+            return {
+                "region": None,
+                "area_m2": 0.0,
+                "current_class": classification,
+                "processing_time_ms": round((time.time() - start_time) * 1000, 2),
+            }
+        geometry = clipped[0]["geometry"]
+
+    area_m2 = polygon_area_m2(geometry)
+    processing_time = (time.time() - start_time) * 1000
+
+    return DetectRegionResponse(
+        region=geometry,
+        area_m2=round(area_m2, 2),
+        current_class=classification,
+        processing_time_ms=round(processing_time, 2),
+    )
+
+
+@app.post("/switch-model")
+async def switch_model(request: SwitchModelRequest):
+    """
+    Dynamically switch the active segmentation model.
+    Reloads the service in-process with the new engine.
+
+    Accepted model IDs:
+      - 'mobilesam'        → MobileSAM (9.6M params, faster)
+      - 'sam2_hiera_small' → SAM 2 Small (46M params, more accurate)
+    """
+    model_to_engine = {
+        "mobilesam": "mobilesam",
+        "sam2_hiera_small": "sam2",
+    }
+
+    engine = model_to_engine.get(request.model)
+    if engine is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{request.model}'. Valid options: {list(model_to_engine.keys())}"
+        )
+
+    try:
+        from .config import get_device_info, SAM2_MODEL_SIZE
+        service = reload_segmentation_service(engine)
+
+        if engine == "sam2":
+            model_variant = SAM2_MODEL_SIZE
+            model_label = "SAM 2 Small"
+        else:
+            model_variant = "mobilesam"
+            model_label = "MobileSAM"
+
+        return {
+            "status": "switched",
+            "model": request.model,
+            "engine": engine,
+            "model_variant": model_variant,
+            "model_label": model_label,
+            "model_loaded": service.is_ready(),
+            "device": get_device_info(),
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to switch model: {e}"
+        )
+
+
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
     return {
         "service": "ESVAL Segmentation Service",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "docs": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "detect_region": "/detect-region",
+        "switch_model": "/switch-model",
     }

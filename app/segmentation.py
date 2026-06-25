@@ -1,9 +1,9 @@
 """
-MobileSAM + CLIP Segmentation Service.
+MobileSAM + SAM 2 + CLIP Segmentation Service.
 Handles model loading, inference, mask generation, and semantic classification.
 
 Architecture:
-- MobileSAM: Generates precise instance masks
+- MobileSAM/SAM 2: Generates precise instance masks
 - CLIP: Classifies each mask semantically
 - Morphology: Post-processes to remove noisy pixels
 """
@@ -13,13 +13,15 @@ import torch
 from PIL import Image
 from typing import Any
 import cv2
-
-from mobile_sam import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+import os
 
 from .config import (
-    get_device, 
-    MODEL_PATH, 
-    MODEL_TYPE, 
+    get_device,
+    SEGMENTATION_ENGINE,
+    MOBILE_SAM_PATH,
+    MOBILE_SAM_TYPE,
+    SAM2_MODEL_PATH,
+    SAM2_MODEL_SIZE,
     DEFAULT_POINTS_PER_SIDE,
     MIN_MASK_AREA
 )
@@ -31,13 +33,67 @@ from .morphology import (
 )
 
 
+def _build_mobilesam():
+    """Build MobileSAM model and predictors."""
+    from mobile_sam import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+
+    model = sam_model_registry[MOBILE_SAM_TYPE](checkpoint=MOBILE_SAM_PATH)
+    model.to(get_device())
+    model.eval()
+
+    predictor = SamPredictor(model)
+    auto_generator = SamAutomaticMaskGenerator(
+        model,
+        points_per_side=DEFAULT_POINTS_PER_SIDE,
+        pred_iou_thresh=0.86,
+        stability_score_thresh=0.92,
+        min_mask_region_area=MIN_MASK_AREA
+    )
+
+    return model, predictor, auto_generator
+
+
+def _build_sam2():
+    """Build SAM 2 model and predictors."""
+    from sam2.build_sam import build_sam2
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+    # SAM 2 model config paths (hydra config paths within the sam2 package)
+    # The config files are at sam2/configs/sam2.1/<config>.yaml
+    sam2_configs = {
+        "sam2_hiera_tiny": "configs/sam2.1/sam2.1_hiera_t.yaml",
+        "sam2_hiera_small": "configs/sam2.1/sam2.1_hiera_s.yaml",
+        "sam2_hiera_base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+        "sam2_hiera_large": "configs/sam2.1/sam2.1_hiera_l.yaml",
+    }
+
+    model_cfg = sam2_configs.get(SAM2_MODEL_SIZE, "configs/sam2.1/sam2.1_hiera_s.yaml")
+    checkpoint = SAM2_MODEL_PATH
+
+    # Build SAM 2 model
+    model = build_sam2(model_cfg, checkpoint, device=get_device())
+
+    # SAM 2 automatic mask generator
+    # Thresholds tuned for satellite/aerial imagery:
+    # Lower thresholds vs MobileSAM defaults to achieve comparable coverage (45%+ vs 14%)
+    auto_generator = SAM2AutomaticMaskGenerator(
+        model,
+        points_per_side=DEFAULT_POINTS_PER_SIDE,
+        pred_iou_thresh=0.80,
+        stability_score_thresh=0.86,
+        min_mask_region_area=MIN_MASK_AREA
+    )
+
+    return model, None, auto_generator  # predictor created lazily
+
+
 class SegmentationService:
     """
-    Service class for MobileSAM-based image segmentation.
+    Service class for MobileSAM/SAM 2 image segmentation.
     Supports both prompted (point/box) and automatic segmentation.
     """
-    
-    def __init__(self):
+
+    def __init__(self, engine: str | None = None):
         self.device = get_device()
         self.model = None
         self.predictor = None
@@ -45,23 +101,18 @@ class SegmentationService:
         self.clip_classifier: CLIPClassifier | None = None
         self._is_ready = False
         self._use_clip = True  # Toggle for CLIP vs HSV classification
-        
+        self._engine = engine if engine is not None else SEGMENTATION_ENGINE
+
     def load_model(self) -> None:
-        """Load the MobileSAM model and initialize predictors."""
+        """Load the segmentation model and initialize predictors."""
         try:
-            self.model = sam_model_registry[MODEL_TYPE](checkpoint=MODEL_PATH)
-            self.model.to(self.device)
-            self.model.eval()
-            
-            self.predictor = SamPredictor(self.model)
-            self.auto_generator = SamAutomaticMaskGenerator(
-                self.model,
-                points_per_side=DEFAULT_POINTS_PER_SIDE,
-                pred_iou_thresh=0.86,
-                stability_score_thresh=0.92,
-                min_mask_region_area=MIN_MASK_AREA
-            )
-            
+            if self._engine == "sam2":
+                self.model, self.predictor, self.auto_generator = _build_sam2()
+                model_name = f"SAM 2 ({SAM2_MODEL_SIZE})"
+            else:
+                self.model, self.predictor, self.auto_generator = _build_mobilesam()
+                model_name = "MobileSAM"
+
             # Load CLIP classifier for semantic classification
             if self._use_clip:
                 try:
@@ -70,20 +121,20 @@ class SegmentationService:
                 except Exception as e:
                     print(f"Warning: Failed to load CLIP classifier, falling back to HSV: {e}")
                     self.clip_classifier = None
-            
+
             self._is_ready = True
-            print(f"Model loaded successfully on {self.device}")
+            print(f"{model_name} loaded successfully on {self.device}")
         except Exception as e:
             print(f"Failed to load model: {e}")
             self._is_ready = False
             raise
-    
+
     def is_ready(self) -> bool:
         """Check if the model is loaded and ready for inference."""
         return self._is_ready
-    
+
     def segment_with_prompts(
-        self, 
+        self,
         image: np.ndarray,
         points: list[list[float]] | None = None,
         point_labels: list[int] | None = None,
@@ -91,75 +142,94 @@ class SegmentationService:
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Segment image using point or box prompts.
-        
+
         Args:
             image: RGB image as numpy array (H, W, 3)
             points: List of [x, y] coordinates for point prompts
             point_labels: Labels for points (1=foreground, 0=background)
             box: Bounding box [x1, y1, x2, y2] for box prompt
-            
+
         Returns:
             Tuple of (masks array, confidence scores array)
         """
-        self.predictor.set_image(image)
-        
-        # Convert prompts to numpy arrays if provided
-        point_coords = np.array(points) if points else None
-        point_labels_arr = np.array(point_labels) if point_labels else None
-        box_arr = np.array(box) if box else None
-        
-        masks, scores, _ = self.predictor.predict(
-            point_coords=point_coords,
-            point_labels=point_labels_arr,
-            box=box_arr,
-            multimask_output=True
-        )
-        
+        if self._engine == "sam2":
+            # SAM 2 uses SAM2ImagePredictor
+            from sam2.sam2_image_predictor import SAM2ImagePredictor
+            if not isinstance(self.predictor, SAM2ImagePredictor):
+                self.predictor = SAM2ImagePredictor(self.model)
+            self.predictor.set_image(image)
+
+            point_coords = np.array(points) if points else None
+            point_labels_arr = np.array(point_labels) if point_labels else None
+            box_arr = np.array(box) if box else None
+
+            masks, scores, _ = self.predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels_arr,
+                box=box_arr,
+                multimask_output=True
+            )
+        else:
+            # MobileSAM
+            self.predictor.set_image(image)
+
+            point_coords = np.array(points) if points else None
+            point_labels_arr = np.array(point_labels) if point_labels else None
+            box_arr = np.array(box) if box else None
+
+            masks, scores, _ = self.predictor.predict(
+                point_coords=point_coords,
+                point_labels=point_labels_arr,
+                box=box_arr,
+                multimask_output=True
+            )
+
         return masks, scores
-    
+
     def auto_segment(
-        self, 
+        self,
         image: np.ndarray,
         apply_morphology: bool = True
     ) -> list[dict[str, Any]]:
         """
         Automatically segment all objects in the image.
-        
+
         Pipeline:
-        1. MobileSAM generates instance masks
+        1. MobileSAM/SAM 2 generates instance masks
         2. CLIP classifies each mask semantically
         3. Morphological post-processing removes noise
-        
+
         Args:
             image: RGB image as numpy array (H, W, 3)
             apply_morphology: Whether to apply noise removal
-            
+
         Returns:
             List of mask dictionaries with segmentation data and classification
         """
-        # Step 1: Generate masks with MobileSAM
+        # Step 1: Generate masks
         masks = self.auto_generator.generate(image)
-        print(f"MobileSAM generated {len(masks)} masks")
-        
+        engine_name = "SAM 2" if self._engine == "sam2" else "MobileSAM"
+        print(f"{engine_name} generated {len(masks)} masks")
+
         # Step 2: Classify each mask using CLIP or HSV
         classified_masks = []
         for mask_data in masks:
             mask = mask_data["segmentation"]
             classification, confidence = self._classify_mask(image, mask)
-            
+
             # Include masks that match our target zones (now including building)
             if classification in ["water", "vegetation", "plantation", "building"]:
                 mask_data["classification"] = classification
                 mask_data["confidence"] = confidence
                 classified_masks.append(mask_data)
-        
+
         print(f"Classified {len(classified_masks)} masks with target classes")
-        
+
         # Step 3: Apply morphological post-processing
         if apply_morphology and len(classified_masks) > 0:
             classified_masks = self._apply_morphology(classified_masks, image.shape[:2])
             print(f"After morphology: {len(classified_masks)} clean masks")
-        
+
         return classified_masks
     
     def _apply_morphology(
@@ -267,4 +337,13 @@ def get_segmentation_service() -> SegmentationService:
     if _service is None:
         _service = SegmentationService()
         _service.load_model()
+    return _service
+
+
+def reload_segmentation_service(engine: str) -> SegmentationService:
+    """Destroy the current singleton and reload with a new engine."""
+    global _service
+    _service = None
+    _service = SegmentationService(engine=engine)
+    _service.load_model()
     return _service

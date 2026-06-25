@@ -49,8 +49,20 @@ def is_gpu_available() -> bool:
 
 
 # Model configuration
-MODEL_PATH = os.environ.get("MODEL_PATH", "models/mobile_sam.pt")
-MODEL_TYPE = "vit_t"  # MobileSAM uses tiny ViT
+# SEGMENTATION_ENGINE: "mobilesam" or "sam2"
+SEGMENTATION_ENGINE = os.environ.get("SEGMENTATION_ENGINE", "mobilesam")
+
+# MobileSAM configuration
+MOBILE_SAM_PATH = os.environ.get("MOBILE_SAM_PATH", "models/mobile_sam.pt")
+MOBILE_SAM_TYPE = "vit_t"
+
+# SAM 2 configuration
+SAM2_MODEL_PATH = os.environ.get("SAM2_MODEL_PATH", "models/sam2_hiera_small.pt")
+SAM2_MODEL_SIZE = "sam2_hiera_small"  # sam2_hiera_tiny, sam2_hiera_small, sam2_hiera_base_plus, sam2_hiera_large
+
+# Active model path (resolved on init based on engine)
+MODEL_PATH = MOBILE_SAM_PATH if SEGMENTATION_ENGINE == "mobilesam" else SAM2_MODEL_PATH
+MODEL_TYPE = MOBILE_SAM_TYPE if SEGMENTATION_ENGINE == "mobilesam" else SAM2_MODEL_SIZE
 
 # API configuration
 MAX_IMAGE_SIZE = 2048  # Maximum image dimension
