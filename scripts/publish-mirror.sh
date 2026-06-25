@@ -91,10 +91,15 @@ git add -A
 git commit -q -m "Mirror snapshot from ${ORIGIN_OWNER}/${REPO_NAME}@${SOURCE_SHA}"
 
 MIRROR_URL="https://x-access-token:${TOKEN}@github.com/${MIRROR_ORG}/${MIRROR_NAME}.git"
+API="https://api.github.com/repos/${MIRROR_ORG}/${MIRROR_NAME}"
 
-if ! gh repo view "${MIRROR_ORG}/${MIRROR_NAME}" &>/dev/null; then
+if ! curl -sf -H "Authorization: Bearer ${TOKEN}" -H "Accept: application/vnd.github+json" "$API" >/dev/null; then
     log "Creando repositorio privado ${MIRROR_ORG}/${MIRROR_NAME}..."
-    gh repo create "${MIRROR_ORG}/${MIRROR_NAME}" --private --description "Mirror de despliegue ESVAL (${REPO_NAME})"
+    curl -sf -X POST \
+        -H "Authorization: Bearer ${TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/orgs/${MIRROR_ORG}/repos" \
+        -d "{\"name\":\"${MIRROR_NAME}\",\"private\":true,\"description\":\"Mirror de despliegue ESVAL (${REPO_NAME})\"}" >/dev/null
 fi
 
 git remote add origin "$MIRROR_URL"

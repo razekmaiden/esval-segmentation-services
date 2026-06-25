@@ -20,6 +20,10 @@ jobs:
       - name: Publish to Innervycs mirror
         env:
           MIRROR_GITHUB_TOKEN: ${{ secrets.MIRROR_SYNC_PAT }}
+          GIT_AUTHOR_NAME: Innervycs Mirror Bot
+          GIT_AUTHOR_EMAIL: info@innervycs.com
+          GIT_COMMITTER_NAME: Innervycs Mirror Bot
+          GIT_COMMITTER_EMAIL: info@innervycs.com
         run: |
           chmod +x scripts/publish-mirror.sh
           ./scripts/publish-mirror.sh
